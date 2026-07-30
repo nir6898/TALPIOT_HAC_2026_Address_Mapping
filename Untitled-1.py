@@ -33,7 +33,10 @@ import re
 import csv
 import json
 import time
+import uuid
 import argparse
+from pathlib import Path
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -247,7 +250,8 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
             pass
 
     out_mode = "a" if done_ids else "w"
-    fieldnames = ["id", "address", "zip", "match_type", "itm_x", "itm_y", "utm_x", "utm_y"]
+    fieldnames = ["id", "address", "city", "street", "house_number", "entrance",
+                  "zip", "match_type", "itm_x", "itm_y", "utm_x", "utm_y"]
     street_cache = {}
     counts = {"exact": 0, "street": 0, "none": 0}
 
@@ -268,7 +272,11 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
                 continue
 
             address = build_label(row)
-            zip5 = row.get("ZIP 5", "").strip()
+            city = row["Location Name"].strip()
+            street = row["Street Name"].strip()
+            house_number = row["House Number"].strip().lstrip("0")
+            entrance = (row.get("Entrance") or "").strip()
+            zip7 = row.get("ZIP 7", "").strip()
 
             hit, match_type = geocode_row(row, street_cache, retries, delay)
             counts[match_type] += 1
@@ -285,7 +293,11 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
             writer.writerow({
                 "id": uid,
                 "address": address,
-                "zip": zip5,
+                "city": city,
+                "street": street,
+                "house_number": house_number,
+                "entrance": entrance,
+                "zip": zip7,
                 "match_type": match_type,
                 "itm_x": itm_x,
                 "itm_y": itm_y,
@@ -306,14 +318,25 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
           file=sys.stderr)
 
 
+def unique_run_filename(prefix="dimona_geocoded"):
+    """A filename that's unique per run: timestamp + a short random suffix so
+    two runs started in the same second never collide."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}.csv"
+
+
 def main():
     ap = argparse.ArgumentParser(description="GovMap Hebrew-address geocoder.")
     ap.add_argument("address", nargs="?", help="Hebrew address to geocode (single lookup mode).")
     ap.add_argument("--url", help="Parse ITM X-Y directly from a govmap share URL.")
     ap.add_argument("--csv", default="dimona_zipcodes.csv",
                     help="Input CSV to batch-geocode (tab-delimited dimona_zipcodes.csv format).")
-    ap.add_argument("--out", default="dimona_addresses_geocoded.csv",
-                    help="Output CSV path for batch mode.")
+    ap.add_argument("--outdir", default="geocode_runs",
+                    help="Folder each batch run's output CSV is written into.")
+    ap.add_argument("--out",
+                    help="Output CSV filename for batch mode (written inside --outdir unless it's "
+                         "an absolute/relative path of its own). Default: an auto-generated unique "
+                         "name per run, e.g. dimona_geocoded_20260730_184230_a1b2c3.csv")
     ap.add_argument("--delay", type=float, default=0.3,
                     help="Seconds to sleep between requests in batch mode.")
     ap.add_argument("--limit", type=int, default=None,
@@ -345,8 +368,19 @@ def main():
             _print_conversions(h["x"], h["y"])
         return
 
-    # Default: batch-geocode the CSV.
-    process_csv(args.csv, args.out, delay=args.delay, limit=args.limit,
+    # Default: batch-geocode the CSV, writing a uniquely-named file per run
+    # into --outdir so repeated runs never clobber each other.
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if args.out:
+        out_path = Path(args.out)
+        if not out_path.parent.name and str(out_path.parent) == ".":
+            out_path = outdir / out_path
+    else:
+        out_path = outdir / unique_run_filename()
+
+    process_csv(args.csv, str(out_path), delay=args.delay, limit=args.limit,
                 resume=not args.no_resume)
 
 

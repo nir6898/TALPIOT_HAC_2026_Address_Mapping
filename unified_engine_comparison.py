@@ -21,8 +21,9 @@ For every source address (from ../dimona_zipcodes.csv) this:
                 between GovMap and Google/OSM and would false-flag under a
                 naive string comparison).
 
-Output: one row per source address in OUTPUT_CSV, plus a printed summary of
-missing addresses / mismatches per engine.
+Output: one row per source address, written to a uniquely-named CSV inside
+../geocode_runs/ (same convention as ../Untitled-1.py), plus a printed
+summary of missing addresses / mismatches per engine.
 
 NOTE on GovMap reverse-geocoding: the only GovMap endpoint this project has
 reverse-engineered (see ../Untitled-1.py) is address-text search. A genuine
@@ -48,26 +49,52 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
 # --- CONFIGURATION ---
-HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parent
+HERE = Path(__file__).resolve().parent          # repo root (this script lives next to Untitled-1.py)
+DATA_DIR = HERE / "google_maps_zipcode_compare"  # cache files + the pre-computed GovMap run live here
 
-ZIPCODE_CSV = REPO_ROOT / "dimona_zipcodes.csv"
-GOVMAP_CACHE_CSV = HERE / "google_maps_zipcode_compare_dimona_geocoded_20260730_191925_046924.csv"
-OUTPUT_CSV = HERE / "engine_comparison.csv"     # fixed name: this is a long job, resumed across runs
+ZIPCODE_CSV = HERE / "dimona_zipcodes.csv"
+GOVMAP_CACHE_CSV = DATA_DIR / "google_maps_zipcode_compare_dimona_geocoded_20260730_191925_046924.csv"
 
-LIMIT = 200          # cap rows for a first pass; set to None for the full ~4,712 addresses
-                      # (full run is multi-hour: OSM's Nominatim caps requests at 1/sec, and each
-                      # address can need up to 3 forward + 2 reverse OSM calls)
+# Same folder + unique-per-run naming convention as Untitled-1.py, so all
+# geocoding output lives in one place. Row-level progress isn't lost across
+# runs even though each run gets a fresh filename: the forward/reverse JSON
+# caches below persist independently and are keyed by address/point, so a
+# fresh run re-adds already-cached rows almost instantly (no repeat API
+# calls) before continuing with genuinely new ones. Pass --out to instead
+# resume a specific prior run's file.
+OUTDIR = HERE / "geocode_runs"
+OUTPUT_PREFIX = "engine_comparison"
+
+LIMIT = None         # None = full ~4,712 addresses (multi-hour: OSM's Nominatim caps requests at
+                      # 1/sec, and each address can need up to 3 forward + 2 reverse OSM calls).
+                      # Set to a small int for a faster partial pass.
 GOVMAP_DELAY = 0.3    # only used if --regeocode-govmap forces a live GovMap pass
 
+def load_env_var(path, var_name):
+    """Minimal .env reader — tolerant of stray spaces/quotes around '=' that
+    would break a plain shell `source` (e.g. `KEY= "value"`)."""
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == var_name:
+            return val.strip().strip('"').strip("'")
+    return ""
+
+
 ENABLE_GOOGLE = True
-GOOGLE_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+GOOGLE_API_KEY_ENV_FILE = HERE / "Google_API_KEY.env"
+GOOGLE_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or load_env_var(GOOGLE_API_KEY_ENV_FILE, "GOOGLE_MAPS_API_KEY")
 GOOGLE_DELAY = 0.05
 
 ENABLE_OSM = True
@@ -77,10 +104,10 @@ OSM_USER_AGENT = f"TALPIOT_HAC_2026_Dimona_EngineComparison/1.0 (contact: {OSM_C
 
 # Reuses the cache already built by google_maps_zipcode_compare_google_address_match.py
 # (683 points already reverse-geocoded via Google — free head start, no key needed to reuse it).
-GOOGLE_REVERSE_CACHE_JSON = HERE / "google_cache.json"
-OSM_REVERSE_CACHE_JSON = HERE / "osm_reverse_cache.json"
-GOOGLE_FORWARD_CACHE_JSON = HERE / "google_forward_cache.json"
-OSM_FORWARD_CACHE_JSON = HERE / "osm_forward_cache.json"
+GOOGLE_REVERSE_CACHE_JSON = DATA_DIR / "google_cache.json"
+OSM_REVERSE_CACHE_JSON = DATA_DIR / "osm_reverse_cache.json"
+GOOGLE_FORWARD_CACHE_JSON = DATA_DIR / "google_forward_cache.json"
+OSM_FORWARD_CACHE_JSON = DATA_DIR / "osm_forward_cache.json"
 
 GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
@@ -90,10 +117,10 @@ CACHE_FLUSH_EVERY = 25
 ROW_LOG_EVERY = 25
 
 
-# ---- reuse GovMap's proven geocoding logic from ../Untitled-1.py instead of duplicating it ----
+# ---- reuse GovMap's proven geocoding logic from Untitled-1.py instead of duplicating it ----
 
 def _load_govmap_module():
-    spec = importlib.util.spec_from_file_location("govmap_geocode", REPO_ROOT / "Untitled-1.py")
+    spec = importlib.util.spec_from_file_location("govmap_geocode", HERE / "Untitled-1.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -566,10 +593,22 @@ def run(limit, out_path, regeocode_govmap, enable_google, google_api_key,
     print(f"\nWrote {out_path}", file=sys.stderr)
 
 
+def unique_run_filename(prefix=OUTPUT_PREFIX):
+    """Same convention as ../Untitled-1.py: timestamp + short random suffix
+    so repeated runs never clobber each other's output."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}.csv"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Three-way GovMap / Google / OSM address comparison.")
     ap.add_argument("--limit", type=int, default=LIMIT)
-    ap.add_argument("--out", default=str(OUTPUT_CSV))
+    ap.add_argument("--outdir", default=str(OUTDIR),
+                    help="Folder each run's output CSV is written into.")
+    ap.add_argument("--out",
+                    help="Output CSV filename (written inside --outdir unless it's an "
+                         "absolute/relative path of its own). Default: an auto-generated "
+                         "unique name per run. Pass this to resume a specific prior run.")
     ap.add_argument("--regeocode-govmap", action="store_true",
                     help="Re-query GovMap live instead of reusing GOVMAP_CACHE_CSV.")
     ap.add_argument("--google", dest="google", action="store_true", default=ENABLE_GOOGLE)
@@ -579,7 +618,17 @@ def main():
     ap.add_argument("--no-resume", action="store_true")
     args = ap.parse_args()
 
-    run(limit=args.limit, out_path=Path(args.out), regeocode_govmap=args.regeocode_govmap,
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if args.out:
+        out_path = Path(args.out)
+        if not out_path.parent.name and str(out_path.parent) == ".":
+            out_path = outdir / out_path
+    else:
+        out_path = outdir / unique_run_filename()
+
+    run(limit=args.limit, out_path=out_path, regeocode_govmap=args.regeocode_govmap,
         enable_google=args.google, google_api_key=GOOGLE_API_KEY,
         enable_osm=args.osm, osm_user_agent=OSM_USER_AGENT, resume=not args.no_resume)
 

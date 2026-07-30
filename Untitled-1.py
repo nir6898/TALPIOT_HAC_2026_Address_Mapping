@@ -32,6 +32,7 @@ import sys
 import re
 import csv
 import json
+import math
 import time
 import uuid
 import argparse
@@ -41,9 +42,28 @@ from urllib.parse import urlparse, parse_qs
 
 import requests
 
+# --- CONFIGURATION ---
+# These are what actually take effect when you run this file with VSCode's
+# ▶ Run button (or `python3 Untitled-1.py` with no arguments) — that path
+# invokes main() with an empty argv, so CLI flags like --osm never apply.
+# Edit these directly for that workflow; the CLI flags below only matter if
+# you're invoking the script from a terminal with explicit arguments.
+BATCH_CSV = "dimona_zipcodes.csv"
+BATCH_OUTDIR = "geocode_runs"
+BATCH_DELAY = 0.3            # seconds between GovMap requests
+ENABLE_OSM = True            # cross-check every row against OSM Nominatim too
+OSM_DELAY = 1.01             # seconds between Nominatim requests (policy min: 1.0)
+
 # --- Endpoints used by the govmap.gov.il front end (es = elasticsearch tier) ---
 AUTOCOMPLETE_URL = "https://es.govmap.gov.il/TldSearch/api/AutoComplete"
 SEARCH_URL = "https://es.govmap.gov.il/TldSearch/api/DetailsByQuery"
+
+# OpenStreetMap's free Nominatim geocoder, used to cross-check GovMap's
+# results (same API/usage pattern as Create_LLA_from_addresses.py: no key
+# needed, but a real identifying User-Agent and a strict 1 req/sec cap are
+# required by Nominatim's usage policy — https://operations.osmfoundation.org/policies/nominatim/).
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSM_USER_AGENT = "TALPIOT_HAC_2026_Dimona_AddressMapping"
 
 # Bitmask selecting which search layers to query. This value = "all layers" as
 # used by the site (addresses, parcels, settlements, streets, ...).
@@ -142,6 +162,50 @@ def itm_to_utm36n(x, y):
     return Transformer.from_crs(2039, 32636, always_xy=True).transform(x, y)
 
 
+def wgs84_to_utm36n(lat, lon):
+    """WGS84 (EPSG:4326) lat/lon -> UTM zone 36N (EPSG:32636) easting/northing.
+    Used to put OSM's lat/lon results on the same grid as GovMap's ITM->UTM
+    output so the two sources can be compared directly."""
+    from pyproj import Transformer
+    return Transformer.from_crs(4326, 32636, always_xy=True).transform(lon, lat)
+
+
+# ---- OpenStreetMap Nominatim geocoder (free, no key — see Create_LLA_from_addresses.py) ----
+
+def osm_geocode(address, user_agent=OSM_USER_AGENT, country_codes="il", timeout=15):
+    """Single call to Nominatim's /search endpoint. Returns the raw HTTP response
+    (not .json()) so callers can inspect status_code, e.g. for 429 handling."""
+    params = {"q": address, "format": "json", "limit": 1, "countrycodes": country_codes}
+    headers = {"User-Agent": user_agent}
+    return requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=timeout)
+
+
+def osm_geocode_with_retry(address, user_agent=OSM_USER_AGENT, retries=3):
+    """osm_geocode() wrapped with retries. Returns (lat, lon, status); lat/lon
+    are None if nothing was found. Mirrors Create_LLA_from_addresses.py:
+    on HTTP 429 it backs off 30s (Nominatim's own recommended cooldown) and
+    retries rather than treating it as a normal failure."""
+    for attempt in range(1, retries + 1):
+        try:
+            r = osm_geocode(address, user_agent)
+            if r.status_code == 429:
+                print(f"  Nominatim rate-limited for '{address}' (attempt {attempt}/{retries}), "
+                      f"backing off 30s", file=sys.stderr)
+                time.sleep(30)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"]), "OK"
+            return None, None, "ZERO_RESULTS"
+        except requests.RequestException as e:
+            print(f"  Nominatim request error for '{address}' (attempt {attempt}/{retries}): {e}",
+                  file=sys.stderr)
+            time.sleep(2)
+
+    return None, None, "FAILED"
+
+
 def _print_conversions(x, y, indent="     "):
     try:
         lon, lat = itm_to_wgs84(x, y)
@@ -171,6 +235,22 @@ def build_label(row):
     output CSV — this is what the row *represents*, independent of what
     query string actually found a match."""
     street = row["Street Name"].strip()
+    house = row["House Number"].strip().lstrip("0")
+    entrance = (row.get("Entrance") or "").strip()
+    city = row["Location Name"].strip()
+
+    parts = [street]
+    if house:
+        parts.append(house + entrance)
+    return f"{' '.join(parts)}, {city}"
+
+
+def build_osm_query(row):
+    """Address string to send to Nominatim (the `countrycodes=il` param already
+    restricts results to Israel, so no country suffix is needed here)."""
+    street = row["Street Name"].strip()
+    if street in UNKNOWN_STREET_MARKERS:
+        return None
     house = row["House Number"].strip().lstrip("0")
     entrance = (row.get("Entrance") or "").strip()
     city = row["Location Name"].strip()
@@ -233,11 +313,18 @@ def geocode_row(row, street_cache, retries, delay):
     return hit, "street" if hit else "none"
 
 
-def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resume=True):
+def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resume=True,
+                 osm_enabled=False, osm_delay=1.01, osm_retries=3, osm_user_agent=OSM_USER_AGENT):
     """Read dimona_zipcodes.csv, geocode every row via GovMap, convert ITM->UTM,
     and write address/id/ITM/UTM/ZIP to output_path. Writes incrementally and can
     resume: rows whose unique ID is already present in an existing output_path
-    are skipped."""
+    are skipped.
+
+    If osm_enabled, each row is also geocoded via OpenStreetMap's Nominatim
+    (free, no key — same API used by Create_LLA_from_addresses.py), converted
+    to the same UTM 36N grid, and compared against the GovMap result
+    (utm_diff_m = straight-line distance between the two). Nominatim's usage
+    policy caps requests at 1/sec, so osm_delay must stay >= 1.0."""
     done_ids = set()
     write_header = True
     if resume:
@@ -250,10 +337,13 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
             pass
 
     out_mode = "a" if done_ids else "w"
-    fieldnames = ["id", "address", "city", "street", "house_number", "entrance",
-                  "zip", "match_type", "itm_x", "itm_y", "utm_x", "utm_y"]
+    fieldnames = ["id", "address", "city", "street", "house_number", "entrance", "zip",
+                  "match_type", "itm_x", "itm_y", "lat", "lon", "utm_x", "utm_y",
+                  "osm_status", "osm_lat", "osm_lon",
+                  "osm_utm_x", "osm_utm_y", "utm_diff_m"]
     street_cache = {}
     counts = {"exact": 0, "street": 0, "none": 0}
+    osm_counts = {"OK": 0, "other": 0}
 
     with open(input_path, newline="", encoding="utf-8-sig") as f_in, \
          open(output_path, out_mode, newline="", encoding="utf-8-sig") as f_out:
@@ -281,14 +371,39 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
             hit, match_type = geocode_row(row, street_cache, retries, delay)
             counts[match_type] += 1
 
-            itm_x = itm_y = utm_x = utm_y = ""
+            itm_x = itm_y = lat_s = lon_s = utm_x = utm_y = ""
+            govmap_utm = None
             if hit:
                 x, y = hit["x"], hit["y"]
                 itm_x, itm_y = f"{x:.2f}", f"{y:.2f}"
+                lon, lat = itm_to_wgs84(x, y)
+                lat_s, lon_s = f"{lat:.6f}", f"{lon:.6f}"
                 ux, uy = itm_to_utm36n(x, y)
                 utm_x, utm_y = f"{ux:.2f}", f"{uy:.2f}"
+                govmap_utm = (ux, uy)
             else:
                 print(f"[{i}] no geocode result for '{address}'", file=sys.stderr)
+
+            osm_status = "skipped"
+            osm_lat = osm_lon = osm_utm_x = osm_utm_y = utm_diff_m = ""
+            if osm_enabled:
+                oquery = build_osm_query(row)
+                if oquery is None:
+                    osm_status = "unknown_street"
+                else:
+                    lat, lon, osm_status = osm_geocode_with_retry(oquery, osm_user_agent, osm_retries)
+                    osm_counts["OK" if osm_status == "OK" else "other"] += 1
+                    if lat is not None:
+                        osm_lat, osm_lon = f"{lat:.6f}", f"{lon:.6f}"
+                        oux, ouy = wgs84_to_utm36n(lat, lon)
+                        osm_utm_x, osm_utm_y = f"{oux:.2f}", f"{ouy:.2f}"
+                        if govmap_utm:
+                            diff = math.hypot(oux - govmap_utm[0], ouy - govmap_utm[1])
+                            utm_diff_m = f"{diff:.2f}"
+                    else:
+                        print(f"[{i}] OSM status={osm_status} for '{oquery}'", file=sys.stderr)
+                # Nominatim's usage policy strictly requires >=1 req/sec pacing.
+                time.sleep(osm_delay)
 
             writer.writerow({
                 "id": uid,
@@ -301,21 +416,33 @@ def process_csv(input_path, output_path, delay=0.3, limit=None, retries=3, resum
                 "match_type": match_type,
                 "itm_x": itm_x,
                 "itm_y": itm_y,
+                "lat": lat_s,
+                "lon": lon_s,
                 "utm_x": utm_x,
                 "utm_y": utm_y,
+                "osm_status": osm_status,
+                "osm_lat": osm_lat,
+                "osm_lon": osm_lon,
+                "osm_utm_x": osm_utm_x,
+                "osm_utm_y": osm_utm_y,
+                "utm_diff_m": utm_diff_m,
             })
             f_out.flush()
 
             if i % 50 == 0:
-                print(f"...processed {i} rows "
-                      f"(exact={counts['exact']} street={counts['street']} none={counts['none']})",
-                      file=sys.stderr)
+                msg = (f"...processed {i} rows "
+                       f"(exact={counts['exact']} street={counts['street']} none={counts['none']})")
+                if osm_enabled:
+                    msg += f"  osm_ok={osm_counts['OK']} osm_other={osm_counts['other']}"
+                print(msg, file=sys.stderr)
 
             time.sleep(delay)
 
-    print(f"Done. Output written to {output_path}. "
-          f"exact={counts['exact']} street={counts['street']} none={counts['none']}",
-          file=sys.stderr)
+    summary = (f"Done. Output written to {output_path}. "
+               f"exact={counts['exact']} street={counts['street']} none={counts['none']}")
+    if osm_enabled:
+        summary += f"  osm_ok={osm_counts['OK']} osm_other={osm_counts['other']}"
+    print(summary, file=sys.stderr)
 
 
 def unique_run_filename(prefix="dimona_geocoded"):
@@ -329,20 +456,34 @@ def main():
     ap = argparse.ArgumentParser(description="GovMap Hebrew-address geocoder.")
     ap.add_argument("address", nargs="?", help="Hebrew address to geocode (single lookup mode).")
     ap.add_argument("--url", help="Parse ITM X-Y directly from a govmap share URL.")
-    ap.add_argument("--csv", default="dimona_zipcodes.csv",
+    ap.add_argument("--csv", default=BATCH_CSV,
                     help="Input CSV to batch-geocode (tab-delimited dimona_zipcodes.csv format).")
-    ap.add_argument("--outdir", default="geocode_runs",
+    ap.add_argument("--outdir", default=BATCH_OUTDIR,
                     help="Folder each batch run's output CSV is written into.")
     ap.add_argument("--out",
                     help="Output CSV filename for batch mode (written inside --outdir unless it's "
                          "an absolute/relative path of its own). Default: an auto-generated unique "
                          "name per run, e.g. dimona_geocoded_20260730_184230_a1b2c3.csv")
-    ap.add_argument("--delay", type=float, default=0.3,
+    ap.add_argument("--delay", type=float, default=BATCH_DELAY,
                     help="Seconds to sleep between requests in batch mode.")
     ap.add_argument("--limit", type=int, default=None,
                     help="Only process the first N rows in batch mode (for testing).")
     ap.add_argument("--no-resume", action="store_true",
                     help="Ignore/overwrite any existing --out file instead of resuming.")
+    ap.add_argument("--osm", dest="osm", action="store_true", default=ENABLE_OSM,
+                    help="Also cross-check every row against OpenStreetMap's Nominatim geocoder "
+                         "(free, no key). Adds osm_lat/osm_lon/osm_utm_x/osm_utm_y/utm_diff_m "
+                         "columns. Nominatim caps requests at 1/sec, so this roughly doubles the "
+                         f"runtime of a full batch. Currently defaults to {ENABLE_OSM} via the "
+                         "ENABLE_OSM constant at the top of the file.")
+    ap.add_argument("--no-osm", dest="osm", action="store_false",
+                    help="Disable the OSM comparison even if ENABLE_OSM is True.")
+    ap.add_argument("--osm-delay", type=float, default=OSM_DELAY,
+                    help="Seconds to sleep between Nominatim requests. Nominatim's usage policy "
+                         "requires >=1.0 — don't lower this below that.")
+    ap.add_argument("--osm-user-agent", default=OSM_USER_AGENT,
+                    help="User-Agent sent to Nominatim, identifying this script per their usage "
+                         "policy (should ideally include contact info for heavy use).")
     args = ap.parse_args()
 
     if args.url:
@@ -380,8 +521,16 @@ def main():
     else:
         out_path = outdir / unique_run_filename()
 
+    if args.osm:
+        if args.osm_delay < 1.0:
+            sys.exit("--osm-delay must be >= 1.0 (Nominatim's usage policy caps requests at 1/sec).")
+        print("OSM comparison enabled (Nominatim, free). Requests are paced at "
+              f"{args.osm_delay}s each per Nominatim's usage policy — a full run will take a while.",
+              file=sys.stderr)
+
     process_csv(args.csv, str(out_path), delay=args.delay, limit=args.limit,
-                resume=not args.no_resume)
+                resume=not args.no_resume, osm_enabled=args.osm,
+                osm_delay=args.osm_delay, osm_user_agent=args.osm_user_agent)
 
 
 if __name__ == "__main__":

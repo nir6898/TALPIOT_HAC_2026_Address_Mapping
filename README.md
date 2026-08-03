@@ -1,0 +1,3 @@
+## How to use
+Create a unified dataset of addresses in a format like the example at google_maps_zipcode_compare\merged__odata__dimona_geocoded_20260730.csv.
+Then run unified_engine_comparison.py (edit the filenames in it according to your input and desired output location) to generate a csv that compares the different locations returned for each address. Run generate_location_mismatch_report.py on the resulting CSV (set the source file in the code) to generate a visual html report from the csv.
